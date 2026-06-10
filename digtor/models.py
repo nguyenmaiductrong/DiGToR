@@ -144,7 +144,9 @@ class DiGToR(nn.Module):
     task-aligned projection space) gated by per-modality reliability.
     """
 
-    def __init__(self, base=32, proj_dim=64, tau=1.0, num_classes=NUM_CLASSES):
+    def __init__(self, base=32, proj_dim=64, tau=1.0, num_classes=NUM_CLASSES,
+                 ablate_signals=None, ablate_routing=None, ablate_proj=None,
+                 ablate_paths=3):
         super().__init__()
         self.enc_v = Encoder(3, base)
         self.enc_t = Encoder(1, base)
@@ -188,6 +190,16 @@ class DiGToR(nn.Module):
 
         self.dec = Decoder(chs[:4], base, num_classes)
         self.tau = tau
+        # Module ablations (defaults = full model). Each disables ONE architectural
+        # component so its contribution can be measured by retraining:
+        #   ablate_signals="d_only"          -> router sees disagreement only (zero c_V,c_T)
+        #   ablate_routing="bottleneck_only" -> drop the coarse->fine skip refinement
+        #   ablate_proj="raw"                -> disagreement from raw cosine (no projection)
+        #   ablate_paths=2                   -> 2-path router (Joint-fusion path forbidden)
+        self.ablate_signals = ablate_signals
+        self.ablate_routing = ablate_routing
+        self.ablate_proj = ablate_proj
+        self.ablate_paths = ablate_paths
         # Learnable reliability-gate strength lambda (one global scalar). The gate
         # adds lambda*log(reliability) to the routing logits so the router will
         # not pick a modality it does not trust. Keeping lambda a parameter lets
@@ -212,12 +224,25 @@ class DiGToR(nn.Module):
         return F.softmax(logits / t, dim=1)
 
     def routing_signals(self, fv_b, ft_b):
-        pv = self.proj_v(fv_b)
-        pt = self.proj_t(ft_b)
+        if self.ablate_proj == "raw":
+            # ablation: skip the task-aligned projection, use raw-feature cosine
+            pv = F.normalize(fv_b, p=2, dim=1)
+            pt = F.normalize(ft_b, p=2, dim=1)
+        else:
+            pv = self.proj_v(fv_b)
+            pt = self.proj_t(ft_b)
         d = 1.0 - (pv * pt).sum(1, keepdim=True)  # cosine distance
         cv = self.rel_v(fv_b)
         ct = self.rel_t(ft_b)
         return d, cv, ct
+
+    def _mask_joint(self, logits):
+        """2-path ablation: forbid the Joint-fusion path so the router must choose
+        between Visible-trust and Thermal-rescue only."""
+        if self.ablate_paths == 2:
+            logits = logits.clone()
+            logits[:, 2:3] = -1e9
+        return logits
 
     @staticmethod
     def _reliability_gate(logits, cv, ct, lam):
@@ -269,9 +294,14 @@ class DiGToR(nn.Module):
         fv_b, ft_b = fv[-1], ft[-1]
 
         d, cv, ct = self.routing_signals(fv_b, ft_b)
-        sig = torch.cat([d, cv, ct, cv * d, ct * d], 1)
+        if self.ablate_signals == "d_only":
+            z = torch.zeros_like(d)
+            sig = torch.cat([d, z, z, z, z], 1)   # router sees disagreement only
+        else:
+            sig = torch.cat([d, cv, ct, cv * d, ct * d], 1)
         logits = self.router(sig)  # B,3,h,w coarse (bottleneck) routing
         logits = self._reliability_gate(logits, cv, ct, lam)
+        logits = self._mask_joint(logits)
         pi_b = self._route(logits, hard, tau)
 
         # Bottleneck routing. Gate the Joint path's modalities by their
@@ -295,21 +325,28 @@ class DiGToR(nn.Module):
         fine_logits, pi_fine = logits, pi_b
         for i in range(3, -1, -1):
             a, b = fv[i], ft[i]
-            pv = F.normalize(self.proj_v_s[i](a), dim=1)
-            pt = F.normalize(self.proj_t_s[i](b), dim=1)
-            di = 1.0 - (pv * pt).sum(1, keepdim=True)
             cvi = torch.sigmoid(self.rel_v_s[i](a))
             cti = torch.sigmoid(self.rel_t_s[i](b))
             cv_s[i], ct_s[i] = cvi, cti
-            up = F.interpolate(cur, size=a.shape[-2:], mode="bilinear",
-                               align_corners=False)
-            # Not a residual on `up`: the coarse router collapses to V, and an
-            # additive residual would impose that V-bias on every fine pixel. Feed
-            # `up` as a feature only and let the supervised local reliability
-            # decide, so the fine router can output T where visible is unreliable.
-            lg = self.refine[i](torch.cat([up, di, cvi, cti,
-                                           cvi * di, cti * di], 1))
-            lg = self._reliability_gate(lg, cvi, cti, lam)
+            if self.ablate_routing == "bottleneck_only":
+                # ablation: no per-scale refinement -- reuse the coarse decision
+                # upsampled to this skip scale (the refine/proj_s modules are unused).
+                lg = F.interpolate(logits, size=a.shape[-2:], mode="bilinear",
+                                   align_corners=False)
+            else:
+                pv = F.normalize(self.proj_v_s[i](a), dim=1)
+                pt = F.normalize(self.proj_t_s[i](b), dim=1)
+                di = 1.0 - (pv * pt).sum(1, keepdim=True)
+                up = F.interpolate(cur, size=a.shape[-2:], mode="bilinear",
+                                   align_corners=False)
+                # Not a residual on `up`: the coarse router collapses to V, and an
+                # additive residual would impose that V-bias on every fine pixel. Feed
+                # `up` as a feature only and let the supervised local reliability
+                # decide, so the fine router can output T where visible is unreliable.
+                lg = self.refine[i](torch.cat([up, di, cvi, cti,
+                                               cvi * di, cti * di], 1))
+                lg = self._reliability_gate(lg, cvi, cti, lam)
+            lg = self._mask_joint(lg)
             cur = lg
             pi_i = self._route(lg, hard, tau)
             skips[i] = (pi_i[:, 0:1] * self.reduce_v[i](a)

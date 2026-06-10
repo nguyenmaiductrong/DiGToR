@@ -104,6 +104,15 @@ def parse(default_dataset=None):
                         "Needs teachers.")
     p.add_argument("--tau_start", type=float, default=1.0)
     p.add_argument("--tau_end", type=float, default=0.2)
+    # --- module ablations (retrain with ONE component removed) ---
+    p.add_argument("--ablate_signals", choices=["d_only"], default=None,
+                   help="module ablation: router sees disagreement only (zero c_V, c_T).")
+    p.add_argument("--ablate_routing", choices=["bottleneck_only"], default=None,
+                   help="module ablation: drop the coarse->fine skip refinement.")
+    p.add_argument("--ablate_proj", choices=["raw"], default=None,
+                   help="module ablation: disagreement from raw cosine (no projection heads).")
+    p.add_argument("--ablate_paths", type=int, choices=[2, 3], default=3,
+                   help="module ablation: 2 forbids the Joint-fusion path (2-path router).")
     # wandb checkpoint sync (optional, failsafe). With --wandb, each new best
     # checkpoint is uploaded as the `<mode>-ckpt` artifact so a dropped Colab
     # session can pull it back (digtor.wandb_ckpt --pull) and skip retraining.
@@ -187,6 +196,68 @@ def evaluate(model, loader, mode, device, num_classes, ignore_classes=(), rel_ga
     return out
 
 
+def digtor_loss(model, core_model, rgb, ir, gt, epoch, args, cfg, device,
+                teacher_v, teacher_t):
+    """Composite DiGToR training objective for one batch.
+
+    Anneals the Gumbel temperature, runs the soft router, and returns
+    (total_loss, components). The total is the segmentation loss plus the
+    task-alignment, reliability, oracle-routing, entropy, path-cost and
+    distillation terms, each scaled by its args.* coefficient -- so every loss
+    hyperparameter is a visible multiplier in one place. Called inside the
+    autocast context, so all ops here honour AMP.
+    """
+    tau = args.tau_start + (args.tau_end - args.tau_start) * epoch / max(args.epochs - 1, 1)
+    rg = 0.0 if args.disable_gate else None           # 0.0 = reliability gate off
+    logit, aux = model(rgb, ir, hard=False, return_aux=True, tau=tau, rel_gate=rg)
+
+    Lseg = seg_loss(logit, gt)
+    Lproj = task_align_loss(core_model.proj_v(aux["fv_b"]),
+                            core_model.proj_t(aux["ft_b"]), gt,
+                            num_classes=cfg.num_classes)
+    Lent = entropy_reg(aux["pi"])
+    Lcost = path_cost_loss(aux["pi"]) if args.lambda_cost > 0 \
+        else torch.zeros((), device=device)
+
+    Lrel = torch.zeros((), device=device)
+    Lroute = torch.zeros((), device=device)
+    if teacher_v is not None and teacher_t is not None:
+        with torch.no_grad():
+            lv = teacher_v(rgb); lt = teacher_t(ir)
+        # Bottleneck + per-scale reliability. The multi-scale term supervises the
+        # fine router's reliability heads so cv_s is low exactly where visible is
+        # wrong -> the fine router can localise the sparse rescue region (else hard
+        # T-rescue stays 0% no matter how strong L_route is).
+        Lrel = reliability_loss(aux["cv"], aux["ct"], lv, lt, gt)
+        if "cv_s" in aux:
+            Lrel = Lrel + ms_reliability_loss(aux["cv_s"], aux["ct_s"], lv, lt, gt)
+        # Oracle routing supervision: without it the Joint path dominates and the
+        # T-rescue path stays at 0% usage.
+        Lroute = route_target_loss(aux["router_logits"], lv, lt, gt,
+                                   route_beta=args.route_beta)
+
+    Ldistill = torch.zeros((), device=device)
+    if args.lambda_distill > 0:
+        # Make the forced pure paths real segmenters, not just KL-matched: a hard
+        # seg-loss on them closes the capacity gap to the standalone teacher, and KD
+        # adds the teacher's soft targets when teachers exist. lv/lt are the teachers
+        # on the same (possibly corrupted) input, so the KD target stays consistent.
+        logit_fv = model(rgb, ir, force_path="v")
+        logit_ft = model(rgb, ir, force_path="t")
+        Ldistill = seg_loss(logit_fv, gt) + seg_loss(logit_ft, gt)
+        if teacher_v is not None and teacher_t is not None:
+            Ldistill = Ldistill + (path_distill_loss(logit_fv, lv)
+                                   + path_distill_loss(logit_ft, lt))
+
+    loss = (Lseg + args.alpha_proj * Lproj + args.beta_rel * Lrel
+            + args.delta_ent * Lent + args.gamma_prior * Lroute
+            + args.lambda_cost * Lcost + args.lambda_distill * Ldistill)
+    comp = dict(seg=_scalar(Lseg), proj=_scalar(Lproj), rel=_scalar(Lrel),
+                ent=_scalar(Lent), route=_scalar(Lroute), cost=_scalar(Lcost),
+                distill=_scalar(Ldistill))
+    return loss, comp
+
+
 def main(default_dataset=None):
     args = parse(default_dataset)
     cfg = _fill_defaults(args)
@@ -216,6 +287,18 @@ def main(default_dataset=None):
     # channels_last (NHWC) is a memory-layout change only -> faster A100 convs,
     # identical maths. Teachers below get the same treatment.
     model = model.to(memory_format=torch.channels_last)
+
+    if args.mode == "digtor":
+        # apply module-ablation switches (no-op unless a flag was passed)
+        model.ablate_signals = args.ablate_signals
+        model.ablate_routing = args.ablate_routing
+        model.ablate_proj = args.ablate_proj
+        model.ablate_paths = args.ablate_paths
+        if any([args.ablate_signals, args.ablate_routing, args.ablate_proj,
+                args.ablate_paths != 3]):
+            print(f"[digtor] MODULE ABLATION: signals={args.ablate_signals} "
+                  f"routing={args.ablate_routing} proj={args.ablate_proj} "
+                  f"paths={args.ablate_paths}")
 
     teacher_v = teacher_t = None
     if args.mode == "digtor":
@@ -301,58 +384,8 @@ def main(default_dataset=None):
                 elif args.mode == "fusion":
                     loss = seg_loss(model(rgb, ir), gt)
                 else:
-                    tau = args.tau_start + (args.tau_end - args.tau_start) * epoch / max(args.epochs - 1, 1)
-                    rg = 0.0 if args.disable_gate else None  # 0.0 = gate off
-                    logit, aux = model(rgb, ir, hard=False, return_aux=True, tau=tau,
-                                       rel_gate=rg)
-                    Lseg = seg_loss(logit, gt)
-                    Lproj = task_align_loss(core_model.proj_v(aux["fv_b"]),
-                                            core_model.proj_t(aux["ft_b"]), gt,
-                                            num_classes=cfg.num_classes)
-                    Lent = entropy_reg(aux["pi"])
-                    Lcost = path_cost_loss(aux["pi"]) if args.lambda_cost > 0 \
-                        else torch.zeros((), device=device)
-                    Lrel = torch.zeros((), device=device)
-                    Lroute = torch.zeros((), device=device)
-                    if teacher_v is not None and teacher_t is not None:
-                        with torch.no_grad():
-                            lv = teacher_v(rgb); lt = teacher_t(ir)
-                        # Bottleneck + per-scale reliability. The multi-scale
-                        # term supervises the fine router's reliability heads so
-                        # cv_s is low exactly where visible is wrong -> the fine
-                        # router can localise the sparse rescue region (else hard
-                        # T-rescue stays 0% no matter how strong L_route is).
-                        Lrel = reliability_loss(aux["cv"], aux["ct"], lv, lt, gt)
-                        if "cv_s" in aux:
-                            Lrel = Lrel + ms_reliability_loss(
-                                aux["cv_s"], aux["ct_s"], lv, lt, gt)
-                        # Oracle routing supervision: without it the Joint path
-                        # dominates and the T-rescue path stays at 0% usage.
-                        Lroute = route_target_loss(aux["router_logits"], lv, lt, gt,
-                                                   route_beta=args.route_beta)
-                    Ldistill = torch.zeros((), device=device)
-                    if args.lambda_distill > 0:
-                        # Make the forced pure paths real segmenters, not just
-                        # KL-matched: a hard seg-loss on them closes the capacity
-                        # gap to the standalone teacher, and KD adds the teacher's
-                        # soft targets when teachers exist. lv/lt are the teachers
-                        # on the same (possibly corrupted) input, so the KD target
-                        # stays consistent with the path's input.
-                        logit_fv = model(rgb, ir, force_path="v")
-                        logit_ft = model(rgb, ir, force_path="t")
-                        Ldistill = seg_loss(logit_fv, gt) + seg_loss(logit_ft, gt)
-                        if teacher_v is not None and teacher_t is not None:
-                            Ldistill = Ldistill + (path_distill_loss(logit_fv, lv)
-                                                   + path_distill_loss(logit_ft, lt))
-                    loss = (Lseg + args.alpha_proj * Lproj
-                            + args.beta_rel * Lrel + args.delta_ent * Lent
-                            + args.gamma_prior * Lroute
-                            + args.lambda_cost * Lcost
-                            + args.lambda_distill * Ldistill)
-                    comp = dict(seg=_scalar(Lseg), proj=_scalar(Lproj),
-                                rel=_scalar(Lrel), ent=_scalar(Lent),
-                                route=_scalar(Lroute), cost=_scalar(Lcost),
-                                distill=_scalar(Ldistill))
+                    loss, comp = digtor_loss(model, core_model, rgb, ir, gt, epoch,
+                                             args, cfg, device, teacher_v, teacher_t)
             if not torch.isfinite(loss):
                 # A non-finite loss (gradient explosion / unstable aux loss)
                 # would otherwise propagate NaN into the weights via opt.step()
