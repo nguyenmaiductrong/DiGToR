@@ -27,6 +27,12 @@ def parse(default_dataset=None):
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", default=None)
     p.add_argument("--max_pixels_per_img", type=int, default=6000)
+    p.add_argument("--ignore_bg", action="store_true",
+                   help="fold class 0 (unlabelled) into the ignore index so the "
+                        "background is excluded from the four-region partition and "
+                        "the sampled detector pixels. Matches the eval_rescue "
+                        "convention; on SemanticRT the background is ~77%% of "
+                        "pixels and otherwise floods the detector's negative class.")
     return p.parse_args()
 
 
@@ -117,6 +123,9 @@ def main(default_dataset=None):
     for batch in loader:
         rgb = batch["rgb"].to(device); ir = batch["ir"].to(device)
         gt = batch["label"].numpy()[0]
+        if args.ignore_bg:
+            gt = gt.copy()
+            gt[gt == 0] = IGNORE_INDEX
         s = pixel_signals(mv, mt, rgb, ir)
         av = correctness_mask(s["pred_v"], gt)
         at = correctness_mask(s["pred_t"], gt)

@@ -30,7 +30,12 @@ def metrics_from_cm(cm, ignore_classes=()):
                      for c in range(len(tp))])
     miou = float(np.nanmean(iou[keep])) if keep.any() else float("nan")
     macc = float(np.nanmean(acc[keep])) if keep.any() else float("nan")
-    freq = gt_sum / max(gt_sum.sum(), 1)
+    # Frequency weights must be normalised over the KEPT classes only. Otherwise,
+    # when a dominant class is ignored (e.g. the unlabelled background, which is
+    # ~77% of SemanticRT pixels), the kept-class frequencies sum to << 1 and FWIoU
+    # is artificially capped at (1 - freq_ignored) regardless of model quality.
+    gt_keep = np.where(keep, gt_sum, 0.0)
+    freq = gt_keep / max(gt_keep.sum(), 1)
     fwiou = float(np.nansum((freq * np.where(np.isnan(iou), 0, iou))[keep]))
     return {
         "mIoU": miou, "mAcc": macc, "FWIoU": fwiou,

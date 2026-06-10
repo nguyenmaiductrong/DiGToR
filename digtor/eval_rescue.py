@@ -86,8 +86,21 @@ def main(default_dataset=None):
     for batch in test_loader:
         rgb = batch["rgb"].to(device); ir = batch["ir"].to(device)
         gt = batch["label"].numpy()[0]
+        # gt_r is the gt used for the rescue/routing analysis only. With
+        # --ignore_bg we fold class 0 into the ignore index so the unlabelled
+        # background is excluded from the four-region partition and the
+        # routing/condition/day-night histograms (all keyed on gt != IGNORE_INDEX).
+        # Otherwise the background (~77% of SemanticRT pixels) floods the "easy"
+        # region and drowns the foreground routing signal. The segmentation
+        # confusion matrices below keep the ORIGINAL gt, so mIoU/mAcc stay
+        # identical to the train.py val convention (background excluded from the
+        # reported mean via ignore_classes, but still penalising foreground FPs).
+        gt_r = gt
+        if args.ignore_bg:
+            gt_r = gt.copy()
+            gt_r[gt_r == 0] = IGNORE_INDEX
         cond = batch["cond"][0]
-        gts.append(gt.astype(np.int16))
+        gts.append(gt_r.astype(np.int16))
         preds, path_idx = {}, None
         for n, m in models.items():
             if n == "v_only":
@@ -109,7 +122,7 @@ def main(default_dataset=None):
             pred_store[n].append(preds[n])
 
         if "v_only" in preds and "t_only" in preds:
-            parts = four_region_partition(preds["v_only"], preds["t_only"], gt, IGNORE_INDEX)
+            parts = four_region_partition(preds["v_only"], preds["t_only"], gt_r, IGNORE_INDEX)
             if path_idx is not None:
                 for r in region_path:
                     m_ = parts[r]
@@ -117,7 +130,7 @@ def main(default_dataset=None):
                         for k in range(3):
                             region_path[r][k] += int(((path_idx == k) & m_).sum())
         if path_idx is not None:
-            valid = gt != IGNORE_INDEX
+            valid = gt_r != IGNORE_INDEX
             ph = np.array([int(((path_idx == k) & valid).sum()) for k in range(3)], float)
             for k in range(3):
                 cond_path[cond][k] += ph[k]
@@ -126,7 +139,7 @@ def main(default_dataset=None):
             img_lum.append(float(batch["lum"][0])); img_path.append(ph)
         if "digtor" in preds:
             cond_pred[cond].append((preds["v_only"], preds["t_only"], preds["digtor"]))
-            cond_gt[cond].append(gt)
+            cond_gt[cond].append(gt_r)
 
     out = {}
     # segmentation
