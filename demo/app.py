@@ -1,311 +1,210 @@
-"""DiGToR — demo truc quan cho bao ve hoc phan.
+"""DiGToR — demo SUY LUAN TRUC TIEP (live inference).
 
-Chay:  streamlit run demo/app.py
+Tai len 1 anh RGB + 1 anh nhiet (thermal) -> mo hinh DiGToR chay that va xuat ra
+**segmentation map** + **routing map** (3 nhanh V-trust / T-rescue / Joint), kem
+cac tin hieu noi bo (disagreement d, do tin cay c_V / c_T) — dung dung pipeline
+cua notebook `digtor_figures_and_gaps.ipynb` (muc 3-4).
 
-App KHONG can GPU/checkpoint: moi so lieu duoc nap tu metrics_data.py (trich
-nguyen van tu log danh gia). Tab "Dinh tuyen truc quan" se hien anh routing-map
-THAT neu da chay demo/precompute.py (sinh ra demo/assets/samples/); neu chua co
-anh, tab hien so do giai thich 3 nhanh de van con dung duoc khi bao ve offline.
+Chay cuc bo:        streamlit run demo/app.py
+Chay tren Colab:    xem notebooks/digtor_demo_colab.ipynb (clone + ckpt + tunnel)
 
-Triet ly trinh bay (reviewer-safe): KHONG ban clean-mIoU. Ban (C2) bo chan doan
-vung giai cuu, (C1) dinh tuyen dien giai duoc, (C3) suy giam duyen dang. Bao cao
-ca ket qua trai chieu (modality-cut FAIL tren SemanticRT, C7 khong y nghia tren
-SemanticRT, FLOPs hien dat hon).
+App nay CAN checkpoint digtor.pt + (tuy chon) GPU. Tro toi thu muc chua digtor.pt
+o thanh ben.
 """
-import json
+import sys
 from pathlib import Path
 
 import numpy as np
-import plotly.graph_objects as go
+from PIL import Image
 import streamlit as st
 
-from metrics_data import (DATA, PATHS, REGIONS, PATH_COLORS, REGION_COLORS)
+# --- cho phep import goi `digtor` du chay tu bat ky thu muc nao (Colab/clone) ---
+REPO = Path(__file__).resolve().parent.parent
+for cand in (REPO, REPO.parent, Path("/content/DiGToR"),
+             Path("/kaggle/working/DiGToR")):
+    if (cand / "digtor").is_dir():
+        sys.path.insert(0, str(cand))
+        REPO = cand
+        break
 
-ASSETS = Path(__file__).parent / "assets" / "samples"
+st.set_page_config(page_title="DiGToR · Live Inference", page_icon="🌡️", layout="wide")
 
-st.set_page_config(page_title="DiGToR Demo", page_icon="🌡️", layout="wide")
+# mau 3 nhanh dinh tuyen (giong notebook): V-trust=xanh, T-rescue=do, Joint=la
+PATH_RGB = np.array([[0x42, 0x87, 0xf5], [0xf0, 0x5a, 0x3c], [0x78, 0xc8, 0x5a]], np.uint8)
+PATH_NAMES = ["V-trust (RGB)", "T-rescue (Nhiet)", "Joint (Hop)"]
 
-# ----------------------------------------------------------------------------- helpers
-PALETTE = {"V-trust": "#4287f5", "T-rescue": "#f05a3c", "Joint": "#78c85a",
-           "fusion": "#888888", "digtor": "#f05a3c", "v_only": "#4287f5",
-           "t_only": "#f0a83c"}
-
-
-def hx(rgb):
-    return "#%02x%02x%02x" % rgb
+# kich thuoc mo hinh duoc huan luyen (giong build_loaders mac dinh)
+HEIGHT, WIDTH = 384, 512
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], np.float32)
 
 
-def metric_delta(a, b):
-    d = a - b
-    return f"{d:+.4f}"
+# ----------------------------------------------------------------------------- preprocessing
+def rgb_to_tensor(pil):
+    """Giong digtor.dataset.fmb._rgb_to_tensor: resize (W,H) -> ImageNet-norm -> CHW."""
+    import torch
+    pil = pil.convert("RGB").resize((WIDTH, HEIGHT), Image.BILINEAR)
+    arr = np.asarray(pil, np.float32) / 255.0
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    return torch.from_numpy(arr.transpose(2, 0, 1).copy())
+
+
+def ir_to_tensor(pil):
+    """Giong _ir_to_tensor: anh nhiet -> 1 kenh, chuan hoa (x-0.5)/0.5."""
+    import torch
+    pil = pil.convert("L").resize((WIDTH, HEIGHT), Image.BILINEAR)
+    arr = np.asarray(pil, np.float32) / 255.0
+    arr = (arr[None] - 0.5) / 0.5
+    return torch.from_numpy(arr.copy())
+
+
+def colorize_labels(lbl, nc):
+    """Index map -> RGB bang colormap tab20 (giong notebook)."""
+    import matplotlib.pyplot as plt
+    cmap = (plt.get_cmap("tab20")(np.arange(nc) % 20)[:, :3] * 255).astype(np.uint8)
+    out = np.zeros((*lbl.shape, 3), np.uint8)
+    m = (lbl >= 0) & (lbl < nc)
+    out[m] = cmap[lbl[m]]
+    return out
+
+
+def signal_to_rgb(arr, cmap_name, vmin=None, vmax=None):
+    """Map xam -> RGB de hien thi (disagreement / reliability)."""
+    import matplotlib.pyplot as plt
+    a = arr.astype(np.float32)
+    lo = a.min() if vmin is None else vmin
+    hi = a.max() if vmax is None else vmax
+    a = (a - lo) / (hi - lo + 1e-6)
+    return (plt.get_cmap(cmap_name)(np.clip(a, 0, 1))[:, :, :3] * 255).astype(np.uint8)
+
+
+# ----------------------------------------------------------------------------- model loading
+@st.cache_resource(show_spinner="Dang nap mo hinh DiGToR…")
+def load_model(dataset, ckpt_path, base):
+    import torch
+    from digtor import get_dataset_config, enable_fast_gpu
+    from digtor.models import DiGToR
+    try:
+        enable_fast_gpu()
+    except Exception:
+        pass
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cfg = get_dataset_config(dataset)
+    model = DiGToR(base=base, num_classes=cfg.num_classes)
+    sd = torch.load(ckpt_path, map_location=device)
+    sd = sd.get("model", sd)
+    model.load_state_dict(sd, strict=False)
+    model.to(device).eval()
+    return model, cfg, device
+
+
+@st.cache_data(show_spinner=False)
+def infer(dataset, ckpt_path, base, rgb_bytes, ir_bytes, hard, use_gate):
+    """Chay DiGToR, tra ve cac map numpy de ve. Cache theo (anh, cau hinh)."""
+    import io
+    import torch
+    import torch.nn.functional as F
+
+    model, cfg, device = load_model(dataset, ckpt_path, base)
+    rgb_pil = Image.open(io.BytesIO(rgb_bytes))
+    ir_pil = Image.open(io.BytesIO(ir_bytes))
+    rgb = rgb_to_tensor(rgb_pil)[None].to(device)
+    ir = ir_to_tensor(ir_pil)[None].to(device)
+
+    rel_gate = None if use_gate else 0.0
+    with torch.no_grad():
+        logit, aux = model(rgb, ir, hard=hard, return_aux=True, rel_gate=rel_gate)
+
+    def up(m):
+        return F.interpolate(m, size=(HEIGHT, WIDTH), mode="bilinear",
+                             align_corners=False)[0, 0].cpu().numpy()
+
+    pi = aux["pi"][0].argmax(0).cpu().numpy()            # HxW in {0,1,2}
+    pred = logit.argmax(1)[0].cpu().numpy()              # HxW class indices
+    share = np.bincount(pi.ravel(), minlength=3) / pi.size
+    return dict(
+        seg=colorize_labels(pred, cfg.num_classes),
+        routing=PATH_RGB[pi],
+        d=signal_to_rgb(up(aux["d"]), "RdBu_r"),
+        cv=signal_to_rgb(up(aux["cv"]), "Blues", 0, 1),
+        ct=signal_to_rgb(up(aux["ct"]), "Oranges", 0, 1),
+        share=share.tolist(),
+        class_names=cfg.class_names,
+        pred=pred,
+        num_classes=cfg.num_classes,
+    )
 
 
 # ----------------------------------------------------------------------------- sidebar
-st.sidebar.title("🌡️ DiGToR")
-st.sidebar.caption("Disagreement-Guided Token Routing for Thermal Rescue")
-ds = st.sidebar.radio("Chuan du lieu", list(DATA.keys()), index=0)
-D = DATA[ds]
-st.sidebar.markdown(f"**{D['title']}**")
-st.sidebar.divider()
-st.sidebar.markdown(
-    "**Luan diem trung tam**\n\n"
-    "Dong gop *khong phai* clean-mIoU (DiGToR ngang, khong vuot fusion — "
-    "dung thiet ke). Dong gop la **(C2)** bo chan doan vung giai cuu, "
-    "**(C1)** dinh tuyen dien giai duoc, **(C3)** suy giam duyen dang."
-)
+st.sidebar.title("🌡️ DiGToR · Live")
+st.sidebar.caption("Disagreement-Guided Token Routing — suy luan truc tiep")
+dataset = st.sidebar.radio("Chuan du lieu (so lop)", ["fmb", "semanticrt"], index=0)
+default_ckpt = str(REPO / ("ckpt_fmb" if dataset == "fmb" else "ckpt_semanticrt") / "digtor.pt")
+ckpt_path = st.sidebar.text_input("Duong dan digtor.pt", value=default_ckpt)
+base = st.sidebar.number_input("base (chieu rong mang)", 8, 128, 32, step=8)
+hard = st.sidebar.checkbox("Hard routing (argmax)", value=True,
+                           help="Bat: moi pixel chon dut khoat 1 nhanh. Tat: tron mem.")
+use_gate = st.sidebar.checkbox("Bat reliability gate (lambda hoc duoc)", value=True)
 
-st.title("DiGToR — Dinh tuyen token huong-bat-dong cho giai cuu nhiet RGB-T")
-st.caption(f"Dang xem: **{ds}** · moi so lieu trich nguyen van tu log danh gia")
+import torch  # noqa: E402  (sau set_page_config de tranh cham khoi dong)
+st.sidebar.caption(f"Thiet bi: **{'CUDA' if torch.cuda.is_available() else 'CPU'}**")
 
-tabs = st.tabs([
-    "📖 Cau chuyen & so chinh",
-    "🎯 C2 · Bo phat hien vung giai cuu",
-    "🧭 C1 · Dinh tuyen dien giai",
-    "🖼️ Dinh tuyen truc quan",
-    "🛡️ C3 · Ben vung & suy giam",
-    "🌗 C7 · Dinh tuyen theo dieu kien",
-    "⚙️ C4 · Hieu nang (FLOPs)",
-])
+# ----------------------------------------------------------------------------- main
+st.title("DiGToR — Segmentation map + Routing map truc tiep")
+st.caption("Tai len 1 anh RGB + 1 anh nhiet -> mo hinh chay that. "
+           "Routing: 🟦 V-trust · 🟥 T-rescue · 🟩 Joint")
 
-# ============================================================ TAB 0 — story + headline
-with tabs[0]:
-    st.subheader("Bai toan & vi sao mIoU khong phai cau chuyen")
-    rp = D["regions_pct"]
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Vung t_rescue (nhiet giai cuu)", f"{rp['t_rescue']:.2f}%")
-    c2.metric("Vung v_preserve", f"{rp['v_preserve']:.2f}%")
-    c3.metric("Vung easy", f"{rp['easy']:.2f}%")
-    c4.metric("Vung hard", f"{rp['hard']:.2f}%")
-    st.info(
-        f"Vung 'giai cuu nhiet' chi chiem **{rp['t_rescue']:.1f}%** so pixel. "
-        "Thanh phan doi moi chi tac dong len thieu so pixel nay, nen khong the "
-        "ky vong cai thien mIoU tong hop (bi chi phoi boi ~80-88% pixel 'de'). "
-        "Gia tri khoa hoc nam o **chat luong quyet dinh tren dung cac vung hiem-nhung-quan-trong**."
-    )
+c1, c2 = st.columns(2)
+rgb_file = c1.file_uploader("Anh RGB (Visible)", type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"])
+ir_file = c2.file_uploader("Anh nhiet (Infrared/Thermal)", type=["png", "jpg", "jpeg", "bmp", "tif", "tiff"])
 
-    st.markdown("#### Phan vung ngu nghia tren du lieu sach (mIoU)")
-    seg = D["segmentation"]
-    fig = go.Figure()
-    names = {"v_only": "Chi-RGB", "t_only": "Chi-Nhiet", "fusion": "Dung hop day dac", "digtor": "DiGToR"}
-    fig.add_bar(x=[names[k] for k in seg], y=[seg[k][0] for k in seg],
-                marker_color=[PALETTE[k] for k in seg],
-                text=[f"{seg[k][0]:.4f}" for k in seg], textposition="outside")
-    fig.update_layout(yaxis_title="mIoU", height=380, showlegend=False,
-                      yaxis_range=[0, max(v[0] for v in seg.values()) * 1.15])
-    st.plotly_chart(fig, use_container_width=True)
-    delta = seg["digtor"][0] - seg["fusion"][0]
-    st.warning(
-        f"**Trung thuc:** DiGToR {metric_delta(seg['digtor'][0], seg['fusion'][0])} mIoU so voi fusion "
-        f"({seg['digtor'][0]:.4f} vs {seg['fusion'][0]:.4f}). Day la *ve vao cua*, khong phai dong gop. "
-        "Mo hinh tinh toan co dieu kien danh doi mot phan dung luong de lay tinh thua, "
-        "dien giai va suy giam duyen dang."
-    )
+if rgb_file:
+    c1.image(rgb_file, caption="RGB dau vao", use_container_width=True)
+if ir_file:
+    c2.image(ir_file, caption="Nhiet dau vao", use_container_width=True)
 
-# ============================================================ TAB 1 — detector (C2)
-with tabs[1]:
-    st.subheader("C2 — Tin hieu DiGToR du bao vung giai cuu tot hon baseline")
-    st.caption("Bai toan phat hien nhi phan tung pixel: 'pixel nay co thuoc vung t_rescue khong?'")
-    det = D["detector"]
-    order = sorted(det, key=lambda k: det[k]["auroc"])
-    fig = go.Figure()
-    fig.add_bar(y=order, x=[det[k]["auroc"] for k in order], orientation="h",
-                marker_color=["#f05a3c" if det[k]["kind"] == "digtor" else "#aaaaaa" for k in order],
-                text=[f"{det[k]['auroc']:.4f}" for k in order], textposition="outside",
-                name="AUROC")
-    fig.update_layout(title="AUROC phat hien vung Thermal-Rescue (do = DiGToR, xam = baseline)",
-                      xaxis_range=[0.5, 1.02], height=380, xaxis_title="AUROC")
-    st.plotly_chart(fig, use_container_width=True)
+if not (rgb_file and ir_file):
+    st.info("Hay tai len ca hai anh (RGB va nhiet) cua **cung mot canh** de chay.")
+    st.stop()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        fig2 = go.Figure()
-        fig2.add_bar(y=order, x=[det[k]["auprc"] for k in order], orientation="h",
-                     marker_color=["#f05a3c" if det[k]["kind"] == "digtor" else "#aaaaaa" for k in order],
-                     text=[f"{det[k]['auprc']:.4f}" for k in order], textposition="outside")
-        fig2.update_layout(title="AUPRC (lop cuc mat can bang)", height=320, xaxis_title="AUPRC")
-        st.plotly_chart(fig2, use_container_width=True)
-    with col2:
-        g = D["decision_gate"]
-        st.markdown("#### Cong quyet dinh")
-        st.metric("Best baseline AUROC", f"{g['best_base'][0]:.4f}", f"AUPRC {g['best_base'][1]:.4f}")
-        st.metric("Best DiGToR AUROC", f"{g['best_digtor'][0]:.4f}",
-                  metric_delta(g['best_digtor'][0], g['best_base'][0]))
-        if g["verdict"] == "PASS":
-            st.success("✅ **PASS** — DiGToR vuot baseline tren CA AUROC LAN AUPRC.")
-        else:
-            st.error("❌ FAIL")
-    st.info(
-        "Day la dong gop **manh nhat va doc lap kien truc**: do tin cay modality la "
-        "tin hieu chan doan vung giai cuu manh hon han cac tin hieu mot-modality "
-        "(do tu tin / entropy / do toi) ma cac phuong phap hien hanh ngam dua vao. "
-        "Tren SemanticRT, AUPRC tang ~2.8x (0.235 -> 0.658)."
-    )
+if not Path(ckpt_path).exists():
+    st.error(f"Khong tim thay checkpoint: `{ckpt_path}`\n\n"
+             "Tren Colab, keo digtor.pt tu W&B/Drive ve thu muc nay truoc "
+             "(xem notebooks/digtor_demo_colab.ipynb).")
+    st.stop()
 
-# ============================================================ TAB 2 — routing alignment (C1)
-with tabs[2]:
-    st.subheader("C1 — Bo dinh tuyen hoi tu ve hanh vi can chinh-giai cuu")
-    st.caption("% pixel cua moi vung GT duoc dinh tuyen vao tung nhanh. Bo dinh tuyen KHONG duoc giam sat dinh tuyen tuong minh.")
-    ra = D["routing_alignment"]
-    fig = go.Figure()
-    for p in PATHS:
-        fig.add_bar(name=p, x=REGIONS, y=[ra[r][p] for r in REGIONS], marker_color=hx(PATH_COLORS[p]))
-    fig.update_layout(barmode="stack", height=420, yaxis_title="% pixel duoc dinh tuyen",
-                      legend_title="Nhanh")
-    st.plotly_chart(fig, use_container_width=True)
+with st.spinner("Dang suy luan…"):
+    try:
+        out = infer(dataset, ckpt_path, int(base), rgb_file.getvalue(),
+                    ir_file.getvalue(), hard, use_gate)
+    except Exception as e:  # noqa: BLE001
+        st.exception(e)
+        st.stop()
 
-    tr_resc = ra["t_rescue"]["T-rescue"]
-    tr_easy = ra["easy"]["T-rescue"]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("T-rescue tai vung t_rescue", f"{tr_resc:.1f}%")
-    c2.metric("T-rescue tai vung easy", f"{tr_easy:.1f}%")
-    c3.metric("Tap trung", f"{tr_resc / max(tr_easy, 1e-6):.1f}×")
-    st.success(
-        f"Nhanh **T-rescue tap trung gap ~{tr_resc/max(tr_easy,1e-6):.0f}×** o vung giai cuu so voi vung easy "
-        f"({tr_resc:.1f}% vs {tr_easy:.1f}%). Vung **easy** dung nhanh V-trust re "
-        f"({ra['easy']['V-trust']:.1f}%); vung **hard** don vao Joint dat "
-        f"({ra['hard']['Joint']:.1f}%). Dinh tuyen tuan theo cau truc giai cuu vat ly, khong phai hop den."
-    )
+st.subheader("Ket qua")
+oc1, oc2 = st.columns(2)
+oc1.image(out["seg"], caption="Segmentation map (DiGToR)", use_container_width=True)
+oc2.image(out["routing"], caption="Routing map (🟦V · 🟥T · 🟩Joint)", use_container_width=True)
 
-# ============================================================ TAB 3 — visual routing maps
-with tabs[3]:
-    st.subheader("Dinh tuyen tung pixel — truc quan")
-    samples = sorted(ASSETS.glob("*.json")) if ASSETS.exists() else []
-    if not samples:
-        st.warning(
-            "Chua co anh routing-map thuc. Sinh tren Google Colab (co GPU + Drive), tu thu muc goc repo:\n\n"
-            "```\n!python demo/precompute.py --dataset "
-            f"{ 'fmb' if ds=='FMB' else 'semanticrt'} --root /content/drive/MyDrive/<DATA_ROOT> "
-            "--ckpt /content/drive/MyDrive/<ckpt_dir>/digtor.pt "
-            "--v_ckpt /content/drive/MyDrive/<ckpt_dir>/v_only.pt "
-            "--t_ckpt /content/drive/MyDrive/<ckpt_dir>/t_only.pt --n 6\n```\n"
-            "Sau do tai thu muc `demo/assets/samples/` ve va chay lai app (xem demo/README.md)."
-        )
-        st.markdown("#### So do 3 nhanh dinh tuyen (de van trinh bay duoc offline)")
-        st.markdown(
-            f"- 🟦 **V-trust** ({hx(PATH_COLORS['V-trust'])}): RGB dang tin -> nhanh RGB nhe, re.\n"
-            f"- 🟥 **T-rescue** ({hx(PATH_COLORS['T-rescue'])}): RGB hong, nhiet giai cuu -> nhanh nhiet.\n"
-            f"- 🟩 **Joint** ({hx(PATH_COLORS['Joint'])}): mo ho/bo sung -> dung hop day du, dat."
-        )
-    else:
-        legend = " · ".join(f"{'🟦🟥🟩'[i]} {p}" for i, p in enumerate(PATHS))
-        st.caption(f"Bang mau nhanh: {legend}")
-        names = [s.stem for s in samples]
-        pick = st.select_slider("Chon anh test", options=names, value=names[0]) if len(names) > 1 else names[0]
-        meta = json.loads((ASSETS / f"{pick}.json").read_text())
-        cols = st.columns(4)
-        for col, (key, cap) in zip(cols, [("rgb", "RGB"), ("ir", "Nhiet"),
-                                          ("routing", "Routing map"), ("region", "Vung GT")]):
-            img = ASSETS / f"{pick}_{key}.png"
-            if img.exists():
-                col.image(str(img), caption=cap, use_container_width=True)
-        st.markdown("**Ti le dinh tuyen tren anh nay:** " +
-                    " · ".join(f"{p} {meta['route_share'].get(p, 0)*100:.1f}%" for p in PATHS))
+sh = out["share"]
+st.markdown("**Ti le dinh tuyen tren anh nay:** " +
+            " · ".join(f"{PATH_NAMES[i]} {sh[i] * 100:.1f}%" for i in range(3)))
+st.progress(min(sh[1], 1.0), text=f"T-rescue (nhanh nhiet giai cuu): {sh[1]*100:.1f}%")
 
-# ============================================================ TAB 4 — robustness (C3)
-with tabs[4]:
-    st.subheader("C3 — Ben vung & suy giam duyen dang duoi hong modality")
-    rob = D["robustness"]
-    th_tags = [t for t in rob if t.startswith("th_")]
-    v_tags = [t for t in rob if t.startswith("v_")]
+with st.expander("Tin hieu noi bo mo hinh (giong Fig. 2 cua paper)"):
+    s1, s2, s3 = st.columns(3)
+    s1.image(out["d"], caption="Disagreement d (V vs T bat dong)", use_container_width=True)
+    s2.image(out["cv"], caption="Do tin cay c_V (RGB)", use_container_width=True)
+    s3.image(out["ct"], caption="Do tin cay c_T (Nhiet)", use_container_width=True)
+    st.caption("Pixel RGB hong (c_V thap) o vung bat dong cao -> router day sang nhanh T-rescue.")
 
-    st.markdown("#### mIoU duoi nhieu (DiGToR vs fusion)")
-    tag_sel = st.multiselect("Chon che do hong", list(rob.keys()),
-                             default=["clean"] + th_tags[:4])
-    fig = go.Figure()
-    for m in ["fusion", "digtor", "t_only"]:
-        fig.add_bar(name={"fusion": "fusion", "digtor": "DiGToR", "t_only": "chi-Nhiet"}[m],
-                    x=tag_sel, y=[rob[t][m] for t in tag_sel], marker_color=PALETTE[m])
-    fig.update_layout(barmode="group", height=400, yaxis_title="mIoU")
-    st.plotly_chart(fig, use_container_width=True)
-
-    mfr = D["mfr"]
-    c1, c2 = st.columns(2)
-    c1.metric("thermal-MFR · DiGToR", f"{mfr['digtor'][0]:.4f}",
-              metric_delta(mfr['digtor'][0], mfr['fusion'][0]) + " vs fusion")
-    c2.metric("visible-MFR · DiGToR", f"{mfr['digtor'][1]:.4f}",
-              metric_delta(mfr['digtor'][1], mfr['fusion'][1]) + " vs fusion")
-
-    st.markdown("#### Tin hieu do-tin-cay phan ung dung modality nao hong")
-    sig = D["signals_under_corruption"]
-    stags = list(sig.keys())
-    fig2 = go.Figure()
-    fig2.add_bar(name="c_v (tin cay RGB)", x=stags, y=[sig[t][1] for t in stags], marker_color="#4287f5")
-    fig2.add_bar(name="c_t (tin cay Nhiet)", x=stags, y=[sig[t][2] for t in stags], marker_color="#f0a83c")
-    fig2.update_layout(barmode="group", height=360, yaxis_title="do tin cay trung binh")
-    st.plotly_chart(fig2, use_container_width=True)
-    st.success(
-        "Khi nhieu nhiet tang, **c_t sut manh** trong khi c_v giu nguyen (va doi xung khi RGB hong). "
-        "Co che tin cay do duoc dung modality nao dang hong -> DiGToR ha trong so nhanh hong, "
-        "vuot fusion duoi hong nhiet (thermal-MFR cao hon)."
-    )
-
-    mc = D["modality_cut"]
-    st.markdown("#### Phan tich 'cat modality' — bao cao trung thuc ket qua trai chieu")
-    if mc["verdict"] == "PASS":
-        st.success(f"✅ **PASS** tren {ds}: cat modality khi cam bien chet vuot fusion "
-                   f"(th_dropout {mc['th_dropout']:+.4f}). {mc['note']}")
-    else:
-        st.error(f"❌ **FAIL** tren {ds}. {mc['note']}")
-        st.caption("Viec mot chuan PASS va mot chuan FAIL duoc trinh bay cong khai la minh chung "
-                   "cho su can trong trong tuyen bo — khong phai diem yeu.")
-
-# ============================================================ TAB 5 — condition (C7)
-with tabs[5]:
-    st.subheader("C7 — Dinh tuyen co tu phat dich chuyen theo dieu kien?")
-    dn = D["day_night"]
-    fig = go.Figure()
-    fig.add_bar(x=["Ngay (sang)", "Dem (toi)"], y=[dn["day_trescue"], dn["night_trescue"]],
-                marker_color=["#f0c040", "#3a4a80"],
-                text=[f"{dn['day_trescue']:.2f}%", f"{dn['night_trescue']:.2f}%"], textposition="outside")
-    fig.update_layout(title="Ti le nhanh T-rescue ngay vs dem", height=360,
-                      yaxis_title="% T-rescue")
-    st.plotly_chart(fig, use_container_width=True)
-    c1, c2 = st.columns(2)
-    c1.metric("Chenh lech ngay-dem", f"{dn['diff']:.4f}")
-    c2.metric("p-value (hoan vi)", f"{dn['p']:.4f}")
-    if dn["significant"]:
-        st.success("✅ Co y nghia thong ke — dem dung nhieu nhanh nhiet hon, *tu phat*, khong giam sat dieu kien.")
-    else:
-        st.warning(
-            "⚠️ **Khong y nghia thong ke** (p ≥ 0.05). SemanticRT gan nhu toan canh thieu sang "
-            f"(median lum {dn['median_lum']:.3f}) nen thieu tuong phan ngay-dem. "
-            "Ta **ha C7 xuong quan sat bo tro dinh tinh** va KHONG them giam sat dieu kien de ep hieu ung."
-        )
-
-    st.markdown("#### Phan bo nhanh theo dieu kien (proxy)")
-    cond = D["conditions"]
-    fig2 = go.Figure()
-    for p in PATHS:
-        fig2.add_bar(name=p, x=list(cond.keys()), y=[cond[c][p] for c in cond],
-                     marker_color=hx(PATH_COLORS[p]))
-    fig2.update_layout(barmode="stack", height=340, yaxis_title="% pixel")
-    st.plotly_chart(fig2, use_container_width=True)
-
-# ============================================================ TAB 6 — FLOPs (C4)
-with tabs[6]:
-    st.subheader("C4 — Hieu nang tinh toan (bao cao thang gioi han hien tai)")
-    fl = D["flops"]
-    base = fl["fusion"]
-    labels = {"fusion": "fusion (1.00×)", "digtor_dense": "DiGToR dense (hien tai)",
-              "token_routing": "(a) token routing", "single_encoder_skip": "(b) bo 1 encoder/anh"}
-    fig = go.Figure()
-    keys = ["fusion", "digtor_dense", "token_routing", "single_encoder_skip"]
-    colors = ["#888", "#f05a3c", "#f0a83c", "#78c85a"]
-    fig.add_bar(x=[labels[k] for k in keys], y=[fl[k] for k in keys], marker_color=colors,
-                text=[f"{fl[k]:.1f}\n({fl[k]/base:.2f}×)" for k in keys], textposition="outside")
-    fig.update_layout(height=400, yaxis_title="GFLOPs @384×512")
-    st.plotly_chart(fig, use_container_width=True)
-    st.warning(
-        f"O dang hien tai, dinh tuyen **dat hon** fusion **{fl['digtor_dense']/base:.2f}×** vi hai encoder "
-        "van chay day du. Encoder chiem ~37% FLOPs va KHONG bo theo tung pixel duoc, nen tiet kiem "
-        f"token-level chi {fl['token_routing']/base:.2f}× fusion. **Don bay thuc te** la bo han mot "
-        f"encoder o muc anh khi cam bien chet: **{fl['single_encoder_skip']/base:.2f}× fusion** "
-        "(tiet kiem ~20%). De tiet kiem thuc su can chuyen gating vao trong encoder (Pha 2.5)."
-    )
-    lat = D["latency_ms"]
-    st.markdown("#### Latency (CUDA, batch 1)")
-    fig2 = go.Figure()
-    fig2.add_bar(x=list(lat.keys()), y=list(lat.values()),
-                 text=[f"{v:.1f} ms" for v in lat.values()], textposition="outside")
-    fig2.update_layout(height=320, yaxis_title="ms")
-    st.plotly_chart(fig2, use_container_width=True)
+with st.expander("Bang mau lop (segmentation legend)"):
+    import matplotlib.pyplot as plt
+    cmap = (plt.get_cmap("tab20")(np.arange(out["num_classes"]) % 20)[:, :3] * 255).astype(np.uint8)
+    present = np.unique(out["pred"])
+    cols = st.columns(4)
+    for j, ci in enumerate(present):
+        name = out["class_names"][ci] if ci < len(out["class_names"]) else str(ci)
+        sw = np.tile(cmap[ci], (24, 60, 1))
+        with cols[j % 4]:
+            st.image(sw, caption=f"{ci}: {name}", use_container_width=False)
